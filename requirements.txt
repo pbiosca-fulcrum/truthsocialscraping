@@ -1,0 +1,6 @@
+# Python version: 3.10+
+click>=8.1.0,<9.0.0
+loguru>=0.7.0,<0.8.0
+python-dotenv>=1.0.1,<2.0.0
+python-dateutil==2.9.0
+curl_cffi>=0.7.0,<0.8.0

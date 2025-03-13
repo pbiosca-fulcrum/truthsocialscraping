@@ -1,0 +1,1068 @@
+# main.py
+# main.py
+from datetime import datetime, timedelta, timezone
+from truthbrush.api import Api
+import json
+import os
+from dotenv import load_dotenv
+from openai import OpenAI
+import requests
+import base64
+import csv
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
+import math
+import time
+
+# Load environment variables (including OPENAI_API_KEY)
+load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+api = Api()
+
+def classify_post(post):
+    """
+    For a given post, determine if it is tariffs related and extract:
+      - tariffs_related: whether the post discusses tariffs/trade issues (true/false)
+      - affected_country: which country is mentioned (if any)
+      - affected_region: which region is mentioned (if any)
+      - products: list of products mentioned (e.g., Champagne, wine, etc.)
+      - published_time: the post's creation time (should match the provided created_at)
+      - tariff_rate: any percentage or rate mentioned (if any)
+      - classification: "threat" vs "official" (or "unknown")
+      - media_analysis: a brief analysis of any media (or null if none)
+      
+    Returns the analysis as a JSON-parsed dictionary.
+    """
+    # Process media: for images, download and encode them as base64 data URLs.
+    media_list = post.get("media", [])
+    enhanced_media_text = ""
+    for m in media_list:
+        if m.get("type") == "image":
+            try:
+                resp = requests.get(m["url"])
+                if resp.status_code == 200:
+                    b64data = base64.b64encode(resp.content).decode("utf-8")
+                    # Assume JPEG MIME type; adjust if needed.
+                    mime = "image/jpeg"
+                    data_url = f"data:{mime};base64,{b64data}"
+                    enhanced_media_text += f"\nImage ({m.get('detail', 'low')}): {data_url}"
+                else:
+                    enhanced_media_text += f"\nImage URL: {m.get('url')}"
+            except Exception:
+                enhanced_media_text += f"\nImage URL: {m.get('url')} (failed to fetch image)"
+        else:
+            enhanced_media_text += f"\nNon-image media: {json.dumps(m)}"
+
+    # Build a prompt text with post details.
+    prompt_text = f"""
+Analyze the following post and provide a JSON object with the following keys:
+- "tariffs_related": true or false
+- "affected_country": string or null
+- "affected_region": string or null
+- "products": a list of strings (empty list if none)
+- "published_time": string (should match the post's created_at)
+- "tariff_rate": string (e.g. "50%", or null if not mentioned)
+- "classification": string ("threat" or "official" or "unknown")
+- "media_analysis": string (a brief analysis of the media if present, or null)
+
+Post details:
+Published time: {post.get("created_at")}
+Content: {post.get("content")}
+Media URLs: {json.dumps(post.get("media"))}
+{enhanced_media_text}
+"""
+    def do_request(text):
+        return client.responses.create(
+            model="gpt-4o-mini",
+            input=[
+                {"role": "system", "content": (
+                    "You are a tariff analysis assistant tasked with reviewing Donald Trump's posts on TruthSocial. "
+                    "Your objective is to identify and analyze Trump's positions, announcements, or intended actions regarding tariffs. "
+                    "Analyze both textual statements and visual content included in his posts. If Trump references news articles, "
+                    "only consider them if he explicitly supports or announces something based on the article's content. "
+                    "Ignore announcements or claims made solely by other individuals unless officially endorsed or mentioned explicitly by Trump himself."
+                    "\n\nRespond strictly with JSON matching the provided schema."
+                )},
+                {"role": "user", "content": text}
+            ],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "tariff_analysis",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "tariffs_related": {"type": "boolean"},
+                            "affected_country": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                            "affected_region": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                            "products": {"type": "array", "items": {"type": "string"}},
+                            "published_time": {"type": "string"},
+                            "tariff_rate": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                            "classification": {"type": "string"},
+                            "media_analysis": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+                        },
+                        "required": [
+                            "tariffs_related",
+                            "affected_country",
+                            "affected_region",
+                            "products",
+                            "published_time",
+                            "tariff_rate",
+                            "classification",
+                            "media_analysis"
+                        ],
+                        "additionalProperties": False
+                    },
+                    "strict": True
+                }
+            }
+        )
+    try:
+        response = do_request(prompt_text)
+        classification = json.loads(response.output_text)
+    except Exception as e:
+        # If error due to length, shorten the prompt and retry.
+        if "too long" in str(e).lower():
+            shortened = prompt_text[:int(len(prompt_text) * 0.9)]
+            try:
+                response = do_request(shortened)
+                classification = json.loads(response.output_text)
+            except Exception as e2:
+                classification = {"error": str(e2)}
+        else:
+            classification = {"error": str(e)}
+    return classification
+
+def write_csv(filename, posts):
+    fieldnames = [
+        "created_at", "content", "media",
+        "tariffs_related", "affected_country", "affected_region",
+        "products", "published_time", "tariff_rate", "classification", "media_analysis"
+    ]
+    with open(filename, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for post in posts:
+            cls = post.get("classification", {})
+            writer.writerow({
+                "created_at": post.get("created_at", ""),
+                "content": post.get("content", ""),
+                "media": json.dumps(post.get("media", [])),
+                "tariffs_related": cls.get("tariffs_related", ""),
+                "affected_country": cls.get("affected_country", ""),
+                "affected_region": cls.get("affected_region", ""),
+                "products": ", ".join(cls.get("products", [])) if cls.get("products") else "",
+                "published_time": cls.get("published_time", ""),
+                "tariff_rate": cls.get("tariff_rate", ""),
+                "classification": cls.get("classification", ""),
+                "media_analysis": cls.get("media_analysis", "")
+            })
+
+def main():
+    # Calculate the datetime for 90 days ago (UTC)
+    created_after = datetime.now(timezone.utc) - timedelta(days=90)
+    # Pull statuses for "realDonaldTrump" posted after the calculated time.
+    posts = list(api.pull_statuses("realDonaldTrump", created_after=created_after))
+
+    # Process posts concurrently with a maximum of 10 workers.
+    def process_post(post):
+        structured = {
+            "created_at": post.get("created_at"),
+            "content": post.get("content"),
+            "media": [{"type": m.get("type"), "url": m.get("url")} for m in post.get("media_attachments", [])]
+        }
+        structured["classification"] = classify_post(structured)
+        time.sleep(1)
+        return structured
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        structured_posts = list(tqdm(executor.map(process_post, posts), total=len(posts), desc="Processing posts"))
+
+    # Create output directory if it doesn't exist
+    output_dir = os.path.join(os.getcwd(), "outputs")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Save all posts (Level 1)
+    with open(os.path.join(output_dir, 'posts.json'), 'w') as file:
+        json.dump(structured_posts, file, indent=2)
+    write_csv(os.path.join(output_dir, 'posts.csv'), structured_posts)
+
+    # Level 2: Tariff-related posts.
+    tariff_posts = [post for post in structured_posts if post.get("classification", {}).get("tariffs_related") is True]
+    with open(os.path.join(output_dir, 'tariff_posts.json'), 'w') as file:
+        json.dump(tariff_posts, file, indent=2)
+    write_csv(os.path.join(output_dir, 'tariff_posts.csv'), tariff_posts)
+
+    # Level 3: Posts where an explicit tariff rate is specified (non-null and non-empty).
+    official_tariff_posts = [post for post in structured_posts if post.get("classification", {}).get("tariff_rate") not in [None, ""]]
+    with open(os.path.join(output_dir, 'official_tariff_posts.json'), 'w') as file:
+        json.dump(official_tariff_posts, file, indent=2)
+    write_csv(os.path.join(output_dir, 'official_tariff_posts.csv'), official_tariff_posts)
+
+    # Also print the outputs
+    print("All posts:")
+    print(json.dumps(structured_posts, indent=2))
+    print("Tariff-related posts:")
+    print(json.dumps(tariff_posts, indent=2))
+    print("Official tariff rate posts:")
+    print(json.dumps(official_tariff_posts, indent=2))
+
+if __name__ == "__main__":
+    main()
+
+
+# test/test_api.py
+from datetime import datetime, timezone
+from dateutil import parser as date_parse
+
+import pytest
+
+from truthbrush.api import Api
+
+
+@pytest.fixture(scope="module")
+def api():
+    return Api()
+
+
+def as_datetime(date_str):
+    """Datetime formatter function. Ensures timezone is UTC. Consider moving to Api class."""
+    return date_parse.parse(date_str).replace(tzinfo=timezone.utc)
+
+
+def test_lookup(api):
+    user = api.lookup(user_handle="realDonaldTrump")
+    assert list(user.keys()) == [
+        "id",
+        "username",
+        "acct",
+        "display_name",
+        "locked",
+        "bot",
+        "discoverable",
+        "group",
+        "created_at",
+        "note",
+        "url",
+        "avatar",
+        "avatar_static",
+        "header",
+        "header_static",
+        "followers_count",
+        "following_count",
+        "statuses_count",
+        "last_status_at",
+        "verified",
+        "location",
+        "website",
+        "accepting_messages",
+        "chats_onboarded",
+        "feeds_onboarded",
+        "show_nonmember_group_statuses",
+        "pleroma",
+        "emojis",
+        "fields",
+    ]
+    assert isinstance(user["id"], str)
+
+
+def test_pull_statuses(api):
+    username = "truthsocial"
+
+    # COMPLETE PULLS
+
+    # it fetches a timeline of the user's posts:
+    full_timeline = list(
+        api.pull_statuses(username=username, replies=False, verbose=True)
+    )
+    assert len(full_timeline) > 25  # more than one page
+
+    # the posts are in reverse chronological order:
+    latest, earliest = full_timeline[0], full_timeline[-1]
+    latest_at, earliest_at = as_datetime(latest["created_at"]), as_datetime(
+        earliest["created_at"]
+    )
+    assert earliest_at < latest_at
+
+    # EMPTY PULLS
+
+    # can use created_after param for filtering out posts:
+    next_pull = list(
+        api.pull_statuses(
+            username=username, replies=False, created_after=latest_at, verbose=True
+        )
+    )
+    assert not any(next_pull)
+
+    # can use since_id param for filtering out posts:
+    next_pull = list(
+        api.pull_statuses(
+            username=username, replies=False, since_id=latest["id"], verbose=True
+        )
+    )
+    assert not any(next_pull)
+
+    # PARTIAL PULLS
+
+    n_posts = 50  # two and a half pages worth, to verify everything is ok
+    recent = full_timeline[n_posts]
+    recent_at = as_datetime(recent["created_at"])
+
+    # can use created_after param for filtering out posts:
+    partial_pull = list(
+        api.pull_statuses(
+            username=username, replies=False, created_after=recent_at, verbose=True
+        )
+    )
+    assert len(partial_pull) == n_posts
+    assert recent["id"] not in [post["id"] for post in partial_pull]
+
+    # can use since_id param for filtering out posts:
+    partial_pull = list(
+        api.pull_statuses(
+            username=username, replies=False, since_id=recent["id"], verbose=True
+        )
+    )
+    assert len(partial_pull) == n_posts
+    assert recent["id"] not in [post["id"] for post in partial_pull]
+
+    # POST INFO
+    # contains status info
+    assert list(latest.keys()) == [
+        "id",
+        "created_at",
+        "in_reply_to_id",
+        "quote_id",
+        "in_reply_to_account_id",
+        "sensitive",
+        "spoiler_text",
+        "visibility",
+        "language",
+        "uri",
+        "url",
+        "content",
+        "account",
+        "media_attachments",
+        "mentions",
+        "tags",
+        "card",
+        "group",
+        "quote",
+        "in_reply_to",
+        "reblog",
+        "sponsored",
+        "replies_count",
+        "reblogs_count",
+        "favourites_count",
+        "favourited",
+        "reblogged",
+        "muted",
+        "pinned",
+        "bookmarked",
+        "poll",
+        "emojis",
+        "_pulled",
+    ]
+    assert isinstance(latest["id"], str)
+
+
+# truthbrush/api.py
+from time import sleep
+from typing import Any, Iterator, List, Optional
+from loguru import logger
+from dateutil import parser as date_parse
+from datetime import datetime, timezone, date
+from curl_cffi import requests
+import json
+import logging
+import os
+from dotenv import load_dotenv
+import random
+
+load_dotenv()  # take environment variables from .env.
+
+logging.basicConfig(
+    level=(
+        logging.DEBUG
+        if os.getenv("DEBUG") and os.getenv("DEBUG").lower() != "false"
+        else logging.INFO
+    )
+)
+
+BASE_URL = "https://truthsocial.com"
+API_BASE_URL = "https://truthsocial.com/api"
+# List of diverse user agents representing different browsers and platforms
+USER_AGENTS = [
+    # Chrome on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    # Chrome on macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    # Firefox on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    # Firefox on macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:123.0) Gecko/20100101 Firefox/123.0",
+    # Safari on macOS
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+    # Edge on Windows
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+    # Mobile browsers
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+]
+
+# Function to get a random user agent
+def get_random_user_agent():
+    return random.choice(USER_AGENTS)
+
+# Current user agent (for backward compatibility)
+USER_AGENT = USER_AGENTS[0]
+
+# Oauth client credentials, from https://truthsocial.com/packs/js/application-d77ef3e9148ad1d0624c.js
+CLIENT_ID = "9X1Fdd-pxNsAgEDNi_SfhJWi8T-vLuV2WVzKIbkTCw4"
+CLIENT_SECRET = "ozF8jzI4968oTKFkEnsBC-UbLPCdrSv0MkXGQu2o_-M"
+
+proxies = {"http": os.getenv("http_proxy"), "https": os.getenv("https_proxy")}
+
+TRUTHSOCIAL_USERNAME = os.getenv("TRUTHSOCIAL_USERNAME")
+TRUTHSOCIAL_PASSWORD = os.getenv("TRUTHSOCIAL_PASSWORD")
+
+TRUTHSOCIAL_TOKEN = os.getenv("TRUTHSOCIAL_TOKEN")
+
+
+class LoginErrorException(Exception):
+    pass
+
+
+class Api:
+    def __init__(
+        self,
+        username=TRUTHSOCIAL_USERNAME,
+        password=TRUTHSOCIAL_PASSWORD,
+        token=TRUTHSOCIAL_TOKEN,
+    ):
+        self.ratelimit_max = 300
+        self.ratelimit_remaining = None
+        self.ratelimit_reset = None
+        self.__username = username
+        self.__password = password
+        self.auth_id = token
+
+    def __check_login(self):
+        """Runs before any login-walled function to check for login credentials and generates an auth ID token"""
+        if self.auth_id is None:
+            if self.__username is None:
+                raise LoginErrorException("Username is missing.")
+            if self.__password is None:
+                raise LoginErrorException("Password is missing.")
+            self.auth_id = self.get_auth_id(self.__username, self.__password)
+            logger.warning(f"Using token {self.auth_id}")
+
+    def _make_session(self):
+        s = requests.Session()
+        return s
+
+    def _check_ratelimit(self, resp):
+        if resp.headers.get("x-ratelimit-limit") is not None:
+            self.ratelimit_max = int(resp.headers.get("x-ratelimit-limit"))
+        if resp.headers.get("x-ratelimit-remaining") is not None:
+            self.ratelimit_remaining = int(resp.headers.get("x-ratelimit-remaining"))
+        if resp.headers.get("x-ratelimit-reset") is not None:
+            self.ratelimit_reset = date_parse.parse(
+                resp.headers.get("x-ratelimit-reset")
+            )
+
+        if (
+            self.ratelimit_remaining is not None and self.ratelimit_remaining <= 50
+        ):  # We do 50 to be safe; their tracking is a bit stochastic... it can jump down quickly
+            now = datetime.utcnow().replace(tzinfo=timezone.utc)
+            time_to_sleep = (
+                self.ratelimit_reset.replace(tzinfo=timezone.utc) - now
+            ).total_seconds()
+            logger.warning(
+                f"Approaching rate limit; sleeping for {time_to_sleep} seconds..."
+            )
+            if time_to_sleep > 0:
+                sleep(time_to_sleep)
+            else:
+                sleep(10)
+
+    def _get(self, url: str, params: dict = None) -> Any:
+        try:
+            resp = self._make_session().get(
+                API_BASE_URL + url,
+                params=params,
+                proxies=proxies,
+                impersonate="chrome123",
+                headers={
+                    "Authorization": "Bearer " + self.auth_id,
+                    "User-Agent": USER_AGENT,
+                },
+            )
+        except curl_cffi.curl.CurlError as e:
+            logger.error(f"Curl error: {e}")
+
+        # Will also sleep
+        self._check_ratelimit(resp)
+
+        try:
+            r = resp.json()
+        except json.JSONDecodeError:
+            logger.error(f"Failed to decode JSON: {resp.text}")
+            r = None
+
+        return r
+
+    def _get_paginated(self, url: str, params: dict = None, resume: str = None) -> Any:
+        next_link = API_BASE_URL + url
+
+        if resume is not None:
+            next_link += f"?max_id={resume}"
+
+        while next_link is not None:
+            resp = self._make_session().get(
+                next_link,
+                params=params,
+                proxies=proxies,
+                impersonate="chrome123",
+                headers={
+                    "Authorization": "Bearer " + self.auth_id,
+                    "User-Agent": USER_AGENT,
+                },
+            )
+            link_header = resp.headers.get("Link", "")
+            next_link = None
+            for link in link_header.split(","):
+                parts = link.split(";")
+                if len(parts) == 2 and parts[1].strip() == 'rel="next"':
+                    next_link = parts[0].strip("<>")
+                    break
+            logger.info(f"Next: {next_link}, resp: {resp}, headers: {resp.headers}")
+            yield resp.json()
+
+            # Will also sleep
+            self._check_ratelimit(resp)
+
+    def user_likes(
+        self, post: str, include_all: bool = False, top_num: int = 40
+    ) -> bool | Any:
+        """Return the top_num most recent (or all) users who liked the post."""
+        self.__check_login()
+        top_num = int(top_num)
+        if top_num < 1:
+            return
+        post = post.split("/")[-1]
+        n_output = 0
+        for followers_batch in self._get_paginated(
+            f"/v1/statuses/{post}/favourited_by", resume=None, params=dict(limit=80)
+        ):
+            for f in followers_batch:
+                yield f
+                n_output += 1
+                if not include_all and n_output >= top_num:
+                    return
+
+    def pull_comments(
+        self,
+        post: str,
+        include_all: bool = False,
+        only_first: bool = False,
+        top_num: int = 40,
+    ):
+        """Return the top_num oldest (or all) replies to a post."""
+        self.__check_login()
+        top_num = int(top_num)
+        if top_num < 1:
+            return
+        post = post.split("/")[-1]
+        n_output = 0
+        for followers_batch in self._get_paginated(
+            f"/v1/statuses/{post}/context/descendants",
+            resume=None,
+            params=dict(sort="oldest"),
+        ):
+            # TO-DO: sort by sort=controversial, sort=newest, sort=oldest, sort=trending
+            for f in followers_batch:
+                if (only_first and f["in_reply_to_id"] == post) or not only_first:
+                    yield f
+                    n_output += 1
+                    if not include_all and n_output >= top_num:
+                        return
+
+    def lookup(self, user_handle: str = None) -> Optional[dict]:
+        """Lookup a user's information."""
+
+        self.__check_login()
+        assert user_handle is not None
+        return self._get("/v1/accounts/lookup", params=dict(acct=user_handle))
+
+    def search(
+        self,
+        searchtype: str = None,
+        query: str = None,
+        limit: int = 40,
+        resolve: bool = 4,
+        offset: int = 0,
+        min_id: str = "0",
+        max_id: str = None,
+    ) -> Optional[dict]:
+        """Search users, statuses or hashtags."""
+
+        self.__check_login()
+        assert query is not None and searchtype is not None
+
+        page = 0
+        while page < limit:
+            if max_id is None:
+                resp = self._get(
+                    "/v2/search",
+                    params=dict(
+                        q=query,
+                        resolve=resolve,
+                        limit=limit,
+                        type=searchtype,
+                        offset=offset,
+                        min_id=min_id,
+                    ),
+                )
+
+            else:
+                resp = self._get(
+                    "/v2/search",
+                    params=dict(
+                        q=query,
+                        resolve=resolve,
+                        limit=limit,
+                        type=searchtype,
+                        offset=offset,
+                        min_id=min_id,
+                        max_id=max_id,
+                    ),
+                )
+
+            offset += 40
+            # added new not sure if helpful
+            if not resp or all(value == [] for value in resp.values()):
+                break
+
+            yield resp
+
+    def trending(self, limit=10):
+        """Return trending truths.
+        Optional arg limit<20 specifies number to return."""
+
+        self.__check_login()
+        return self._get(f"/v1/truth/trending/truths?limit={limit}")
+
+    def group_posts(self, group_id: str, limit=20):
+        self.__check_login()
+        timeline = []
+        posts = self._get(f"/v1/timelines/group/{group_id}?limit={limit}")
+        while posts != None:
+            timeline += posts
+            limit = limit - len(posts)
+            if limit <= 0:
+                break
+            max_id = posts[-1]["id"]
+            posts = self._get(
+                f"/v1/timelines/group/{group_id}?max_id={max_id}&limit={limit}"
+            )
+        return timeline
+
+    def tags(self):
+        """Return trending tags."""
+
+        self.__check_login()
+        return self._get("/v1/trends")
+
+    def suggested(self, maximum: int = 50) -> dict:
+        """Return a list of suggested users to follow."""
+        self.__check_login()
+        return self._get(f"/v2/suggestions?limit={maximum}")
+
+    def trending_groups(self, limit=10):
+        """Return trending group truths.
+        Optional arg limit<20 specifies number to return."""
+
+        self.__check_login()
+        return self._get(f"/v1/truth/trends/groups?limit={limit}")
+
+    def group_tags(self):
+        """Return trending group tags."""
+
+        self.__check_login()
+        return self._get("/v1/groups/tags")
+
+    def suggested_groups(self, maximum: int = 50) -> dict:
+        """Return a list of suggested groups to follow."""
+        self.__check_login()
+        return self._get(f"/v1/truth/suggestions/groups?limit={maximum}")
+
+    def ads(self, device: str = "desktop") -> dict:
+        """Return a list of ads from Rumble's Ad Platform via Truth Social API."""
+
+        self.__check_login()
+        return self._get(f"/v3/truth/ads?device={device}")
+
+    def user_followers(
+        self,
+        user_handle: str = None,
+        user_id: str = None,
+        maximum: int = 1000,
+        resume: str = None,
+    ) -> Iterator[dict]:
+        assert user_handle is not None or user_id is not None
+        user_id = user_id if user_id is not None else self.lookup(user_handle)["id"]
+
+        n_output = 0
+        for followers_batch in self._get_paginated(
+            f"/v1/accounts/{user_id}/followers", resume=resume
+        ):
+            for f in followers_batch:
+                yield f
+                n_output += 1
+                if maximum is not None and n_output >= maximum:
+                    return
+
+    def user_following(
+        self,
+        user_handle: str = None,
+        user_id: str = None,
+        maximum: int = 1000,
+        resume: str = None,
+    ) -> Iterator[dict]:
+        assert user_handle is not None or user_id is not None
+        user_id = user_id if user_id is not None else self.lookup(user_handle)["id"]
+
+        n_output = 0
+        for followers_batch in self._get_paginated(
+            f"/v1/accounts/{user_id}/following", resume=resume
+        ):
+            for f in followers_batch:
+                yield f
+                n_output += 1
+                if maximum is not None and n_output >= maximum:
+                    return
+
+    def pull_statuses(
+        self,
+        username: str,
+        replies=False,
+        verbose=False,
+        created_after: datetime = None,
+        since_id=None,
+        pinned=False,
+    ) -> List[dict]:
+        """Pull the given user's statuses.
+
+        Params:
+            created_after : timezone aware datetime object
+            since_id : number or string
+
+        Returns a list of posts in reverse chronological order,
+            or an empty list if not found.
+        """
+
+        params = {}
+        user_id = self.lookup(username)["id"]
+        page_counter = 0
+        keep_going = True
+        while keep_going:
+            try:
+                url = f"/v1/accounts/{user_id}/statuses"
+                if pinned:
+                    url += "?pinned=true&with_muted=true"
+                elif not replies:
+                    url += "?exclude_replies=true"
+                if verbose:
+                    logger.debug("--------------------------")
+                    logger.debug(f"{url} {params}")
+                result = self._get(url, params=params)
+                page_counter += 1
+            except json.JSONDecodeError as e:
+                logger.error(f"Unable to pull user #{user_id}'s statuses': {e}")
+                break
+            except Exception as e:
+                logger.error(f"Misc. error while pulling statuses for {user_id}: {e}")
+                break
+
+            if "error" in result:
+                logger.error(
+                    f"API returned an error while pulling user #{user_id}'s statuses: {result}"
+                )
+                break
+
+            if len(result) == 0:
+                break
+
+            if not isinstance(result, list):
+                logger.error(f"Result is not a list (it's a {type(result)}): {result}")
+
+            posts = sorted(
+                result, key=lambda k: k["id"], reverse=True
+            )  # reverse chronological order (recent first, older last)
+            params["max_id"] = posts[-1][
+                "id"
+            ]  # when pulling the next page, get posts before this (the oldest)
+
+            if verbose:
+                logger.debug(f"PAGE: {page_counter}")
+
+            if pinned:  # assume single page
+                keep_going = False
+
+            for post in posts:
+                post["_pulled"] = datetime.now().isoformat()
+
+                # only keep posts created after the specified date
+                # exclude posts created before the specified date
+                # since the page is listed in reverse chronology, we don't need any remaining posts on this page either
+                post_at = date_parse.parse(post["created_at"]).replace(
+                    tzinfo=timezone.utc
+                )
+                if (created_after and post_at <= created_after) or (
+                    since_id and post["id"] <= since_id
+                ):
+                    keep_going = False  # stop the loop, request no more pages
+                    break  # do not yeild this post or remaining (older) posts on this page
+
+                if verbose:
+                    logger.debug(f"{post['id']} {post['created_at']}")
+
+                yield post
+
+    def get_auth_id(self, username: str, password: str) -> str:
+        """Logs in to Truth account and returns the session token"""
+        url = BASE_URL + "/oauth/token"
+        try:
+            payload = {
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "grant_type": "password",
+                "username": username,
+                "password": password,
+                "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+                "scope": "read",
+            }
+
+            sess_req = requests.request(
+                "POST",
+                url,
+                json=payload,
+                proxies=proxies,
+                impersonate="chrome123",
+                headers={
+                    "User-Agent": USER_AGENT,
+                },
+            )
+            sess_req.raise_for_status()
+        except requests.RequestsError as e:
+            logger.error(f"Failed login request: {str(e)}")
+            raise SystemExit('Cannot authenticate to .')
+
+        if not sess_req.json()["access_token"]:
+            raise ValueError("Invalid truthsocial.com credentials provided!")
+
+        return sess_req.json()["access_token"]
+
+
+# truthbrush/cli.py
+"""Defines the CLI for Truthbrush."""
+
+import json
+import click
+from datetime import date
+import datetime
+from .api import Api
+
+api = Api()
+
+
+@click.group()
+def cli():
+    """This is an API client for Truth Social."""
+
+
+@cli.command()
+@click.argument("group_id")
+@click.option(
+    "--limit", default=20, help="Limit the number of items returned", type=int
+)
+def groupposts(group_id: str, limit: int):
+    """Pull posts from group timeline"""
+
+    print(json.dumps(api.group_posts(group_id, limit)))
+
+
+@cli.command()
+def trends():
+    """Pull trendy Truths."""
+
+    print(json.dumps(api.trending()))
+
+
+@cli.command()
+def tags():
+    """Pull trendy tags."""
+
+    print(json.dumps(api.tags()))
+
+
+@cli.command()
+def grouptags():
+    """Pull group tags."""
+
+    print(json.dumps(api.group_tags()))
+
+
+@cli.command()
+def grouptrends():
+    """Pull group trends."""
+
+    print(json.dumps(api.trending_groups()))
+
+
+@cli.command()
+def groupsuggest():
+    """Pull group suggestions."""
+
+    print(json.dumps(api.suggested_groups()))
+
+
+@cli.command()
+@click.argument("handle")
+def user(handle: str):
+    """Pull a user's metadata."""
+
+    print(json.dumps(api.lookup(handle)))
+
+
+@cli.command()
+@click.argument("query")
+@click.option(
+    "--searchtype",
+    help="Type of search query (accounts, statuses, groups, or hashtags)",
+    type=click.Choice(["accounts", "statuses", "hashtags", "groups"]),
+)
+@click.option(
+    "--limit", default=40, help="Limit the number of items returned", type=int
+)
+@click.option("--resolve", help="Resolve", type=bool)
+def search(searchtype: str, query: str, limit: int, resolve: bool):
+    """Search for users, statuses, groups, or hashtags."""
+
+    for page in api.search(searchtype, query, limit, resolve):
+        print(json.dumps(page[searchtype]))
+
+
+@cli.command()
+def suggestions():
+    """Pull the list of suggested users."""
+
+    print(json.dumps(api.suggested()))
+
+
+@cli.command()
+def ads():
+    """Pull ads."""
+
+    print(json.dumps(api.ads()))
+
+
+# @cli.command()
+# @click.argument("handle")
+# @click.option("--maximum", help="the maximum number of followers to pull", type=int)
+# @click.option(
+#     "--resume",
+#     help="the `max_id` cursor to resume from, if necessary (pull this from logs to resume a failed/stalled export)",
+#     type=str,
+# )
+# def followers(handle: str, maximum: int = None, resume: str = None):
+#     """Pull a user's followers."""
+
+#     for follower in api.user_followers(handle, maximum=maximum, resume=resume):
+#         print(json.dumps(follower))
+
+
+# @cli.command()
+# @click.argument("handle")
+# @click.option(
+#     "--maximum", help="the maximum number of followed users to pull", type=int
+# )
+# @click.option(
+#     "--resume",
+#     help="the `max_id` cursor to resume from, if necessary (pull this from logs to resume a failed/stalled export)",
+#     type=str,
+# )
+# def following(handle: str, maximum: int = None, resume: str = None):
+#     """Pull users a given user follows."""
+
+#     for followed in api.user_following(handle, maximum=maximum, resume=resume):
+#         print(json.dumps(followed))
+
+
+@cli.command()
+@click.argument("username")
+@click.option(
+    "--replies/--no-replies",
+    default=False,
+    help="Include replies when pulling posts (defaults to no replies)",
+)
+@click.option(
+    "--created-after",
+    default=None,
+    help="Only pull posts created on or after the specified datetime, e.g. 2021-10-02 or 2011-11-04T00:05:23+04:00 (defaults to none). If a timezone is not specified, UTC is assumed.",
+    type=datetime.datetime.fromisoformat,
+)
+@click.option(
+    "--pinned/--all", default=False, help="Only pull pinned posts (defaults to all)"
+)
+def statuses(
+    username: str,
+    replies: bool = False,
+    created_after: date = None,
+    pinned: bool = False,
+):
+    """Pull a user's statuses"""
+
+    # Assume UTC if no timezone is specified
+    if created_after and created_after.tzinfo is None:
+        created_after = created_after.replace(tzinfo=datetime.timezone.utc)
+
+    for page in api.pull_statuses(
+        username, created_after=created_after, replies=replies, pinned=pinned
+    ):
+        print(json.dumps(page))
+
+
+@cli.command()
+@click.argument("post")
+@click.option("--includeall", is_flag=True, help="return all comments on post.")
+@click.argument("top_num")
+def likes(post: str, includeall: bool, top_num: int):
+    """Pull the top_num most recent users who liked the post."""
+    for page in api.user_likes(post, includeall, top_num):
+        print(json.dumps(page))
+
+
+@cli.command()
+@click.argument("post")
+@click.option(
+    "--includeall", is_flag=True, help="return all comments on post. Overrides top_num."
+)
+@click.option(
+    "--onlyfirst", is_flag=True, help="return only direct replies to specified post"
+)
+@click.argument("top_num")
+def comments(post: str, includeall: bool, onlyfirst: bool, top_num: int = 40):
+    """Pull the top_num comments on a post (defaults to all users, including replies)."""
+    for page in api.pull_comments(post, includeall, onlyfirst, top_num):
+        print(page)
+
+
+# truthbrush/__init__.py
+from truthbrush.api import Api
+
+
+Just modify those files that need so, for those, give the full code once modified. 

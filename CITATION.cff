@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "Feel free to cite this software in your research."
+authors:
+  - family-names: McCain
+    given-names: Miles
+  - family-names: Thiel
+    given-names: David
+    orcid: https://orcid.org/0000-0002-0947-5921
+title: "Truthbrush"
+version: 0.1.8
+date-released: 2022-02-26
+url: https://github.com/stanfordio/truthbrush
